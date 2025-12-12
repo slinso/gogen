@@ -211,6 +211,103 @@ export type {{ .Name }} = z.infer<typeof {{ .Name }}Schema>;
 	}
 }
 
+// TestE2E_ValibotGeneration tests Valibot schema generation.
+func TestE2E_ValibotGeneration(t *testing.T) {
+	inputContent := `package models
+
+type Product struct {
+	ID    string  ` + "`json:\"id\"`" + `
+	Name  string  ` + "`json:\"name\"`" + `
+	Price float64 ` + "`json:\"price\"`" + `
+	Tags  []string ` + "`json:\"tags\"`" + `
+	Meta  map[string]any ` + "`json:\"meta,omitempty\"`" + `
+	Alias *string ` + "`json:\"alias,omitempty\"`" + `
+}
+`
+	tmpDir := t.TempDir()
+	inputPath := filepath.Join(tmpDir, "input.go")
+	templatePath := filepath.Join(tmpDir, "valibot.tmpl")
+
+	if err := os.WriteFile(inputPath, []byte(inputContent), 0644); err != nil {
+		t.Fatalf("failed to write input file: %v", err)
+	}
+
+	templateContent := `{{- /* Valibot validation schemas */ -}}
+import * as v from 'valibot';
+{{ range .Types }}
+{{- if eq .Kind "struct" }}
+export const {{ .Name }}Schema = v.object({
+{{- range $i, $f := .Fields }}
+  {{ tagOrName $f }}: {{ template "valibotType" $f.Type }}{{ if isOptional $f }}.optional(){{ end }},
+{{- end }}
+});
+
+export type {{ .Name }} = v.InferOutput<typeof {{ .Name }}Schema>;
+{{ end -}}
+{{ end }}
+{{- define "valibotType" -}}
+{{- if eq .Kind "basic" -}}
+{{- if eq .Name "string" -}}v.string()
+{{- else if eq .Name "bool" -}}v.boolean()
+{{- else if or (hasPrefix .Name "int") (hasPrefix .Name "uint") (hasPrefix .Name "float") (eq .Name "byte") (eq .Name "rune") -}}v.number()
+{{- else if eq .Name "any" -}}v.unknown()
+{{- else -}}v.unknown()
+{{- end -}}
+{{- else if eq .Kind "slice" -}}v.array({{ template "valibotType" .Elem }})
+{{- else if eq .Kind "array" -}}v.array({{ template "valibotType" .Elem }})
+{{- else if eq .Kind "map" -}}v.record({{ template "valibotType" .Key }}, {{ template "valibotType" .Value }})
+{{- else if eq .Kind "pointer" -}}v.nullable({{ template "valibotType" .Elem }})
+{{- else -}}v.unknown()
+{{- end -}}
+{{- end -}}
+`
+	if err := os.WriteFile(templatePath, []byte(templateContent), 0644); err != nil {
+		t.Fatalf("failed to write template file: %v", err)
+	}
+
+	cfg := config.New()
+	p := parser.New()
+
+	file, err := p.ParseFile(inputPath)
+	if err != nil {
+		t.Fatalf("failed to parse file: %v", err)
+	}
+
+	gen := generator.New(cfg)
+	if err := gen.LoadTemplate(templatePath); err != nil {
+		t.Fatalf("failed to load template: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := gen.Generate(file, &buf); err != nil {
+		t.Fatalf("failed to generate: %v", err)
+	}
+
+	output := buf.String()
+
+	tests := []struct {
+		name     string
+		contains string
+	}{
+		{"valibot import", "import * as v from 'valibot';"},
+		{"ProductSchema", "export const ProductSchema = v.object({"},
+		{"id v.string", "id: v.string()"},
+		{"price v.number", "price: v.number()"},
+		{"tags v.array", "tags: v.array(v.string())"},
+		{"meta v.record optional", "meta: v.record(v.string(), v.unknown()).optional()"},
+		{"alias v.nullable optional", "alias: v.nullable(v.string()).optional()"},
+		{"type inference", "export type Product = v.InferOutput<typeof ProductSchema>;"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !strings.Contains(output, tc.contains) {
+				t.Errorf("output does not contain %q\nGot:\n%s", tc.contains, output)
+			}
+		})
+	}
+}
+
 // TestE2E_EmbeddedFields tests that embedded fields are flattened.
 func TestE2E_EmbeddedFields(t *testing.T) {
 	inputContent := `package models
@@ -1053,6 +1150,39 @@ func TestE2E_IntegrationWithExamples(t *testing.T) {
 		}
 		if !strings.Contains(output, "UserSchema") {
 			t.Error("Zod output should contain UserSchema")
+		}
+	})
+
+	t.Run("Valibot generation", func(t *testing.T) {
+		valibotTemplatePath := "templates/valibot.tmpl"
+		if _, err := os.Stat(valibotTemplatePath); os.IsNotExist(err) {
+			t.Skip("valibot.tmpl not found")
+		}
+
+		gen := generator.New(cfg)
+		if err := gen.LoadTemplate(valibotTemplatePath); err != nil {
+			t.Fatalf("failed to load Valibot template: %v", err)
+		}
+
+		var buf bytes.Buffer
+		if err := gen.Generate(file, &buf); err != nil {
+			t.Fatalf("failed to generate Valibot: %v", err)
+		}
+
+		output := buf.String()
+		if len(output) == 0 {
+			t.Error("generated empty Valibot output")
+		}
+
+		// Basic sanity checks
+		if !strings.Contains(output, "import * as v from 'valibot'") {
+			t.Error("Valibot output should contain import")
+		}
+		if !strings.Contains(output, "UserSchema") {
+			t.Error("Valibot output should contain UserSchema")
+		}
+		if !strings.Contains(output, "v.InferOutput") {
+			t.Error("Valibot output should contain type inference")
 		}
 	})
 }
