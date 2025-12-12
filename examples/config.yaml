@@ -1,0 +1,36 @@
+# gogen configuration file
+
+# Type mappings: Go type -> Target language type
+typeMappings:
+  # Basic types (these override defaults)
+  string: "string"
+  bool: "boolean"
+  int: "number"
+  int64: "number"
+  float64: "number"
+
+  # Special types
+  "[]byte": "string"              # Base64 encoded
+  "time.Time": "string"           # ISO 8601
+  "time.Duration": "number"       # Nanoseconds
+  "interface{}": "unknown"
+  "any": "unknown"
+
+  # Common library types
+  "uuid.UUID": "string"
+  "decimal.Decimal": "string"     # String for precision
+  "json.RawMessage": "unknown"
+
+# Generation options
+options:
+  # Template execution mode
+  perType: false                  # Execute template once for all types (not per-type)
+
+  # Filtering
+  exportedOnly: true              # Only process exported types
+  # includeTypes: []              # Empty = include all (or list specific types)
+  # excludeTypes:                 # Types to exclude from generation
+  #   - "internalConfig"
+
+  # Tag handling
+  tagKey: "json"                  # Use json tags for field names
