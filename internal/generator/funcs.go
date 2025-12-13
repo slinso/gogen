@@ -1,6 +1,7 @@
 package generator
 
 import (
+	"fmt"
 	"strings"
 	"text/template"
 	"unicode"
@@ -8,6 +9,12 @@ import (
 	"gogen/internal/config"
 	"gogen/internal/model"
 )
+
+// ValidateRule represents a parsed validation rule from a validate tag.
+type ValidateRule struct {
+	Name  string // Rule name (e.g., "min", "max", "email")
+	Value string // Rule value (e.g., "1", "45", empty for boolean rules)
+}
 
 // templateFuncs returns custom template functions.
 func templateFuncs(cfg *config.Config) template.FuncMap {
@@ -68,6 +75,11 @@ func templateFuncs(cfg *config.Config) template.FuncMap {
 
 		// Misc
 		"notLast": func(i, length int) bool { return i < length-1 },
+
+		// Valibot form helpers
+		"valibotFormField": valibotFormField,
+		"hasValidateRule":  hasValidateRule,
+		"getValidateValue": getValidateValue,
 	}
 }
 
@@ -286,4 +298,190 @@ func ternary(condition bool, a, b string) string {
 		return a
 	}
 	return b
+}
+
+// parseValidateTag parses a validate struct tag and returns a list of rules.
+// Input: "required,min=1,max=45"
+// Output: []ValidateRule{{Name: "required"}, {Name: "min", Value: "1"}, {Name: "max", Value: "45"}}
+func parseValidateTag(field model.Field) []ValidateRule {
+	tagValue, ok := field.Tag.Values["validate"]
+	if !ok || tagValue == "" {
+		return nil
+	}
+
+	var rules []ValidateRule
+	parts := strings.Split(tagValue, ",")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		if idx := strings.Index(part, "="); idx > 0 {
+			rules = append(rules, ValidateRule{
+				Name:  part[:idx],
+				Value: part[idx+1:],
+			})
+		} else {
+			rules = append(rules, ValidateRule{
+				Name: part,
+			})
+		}
+	}
+	return rules
+}
+
+// hasValidateRule checks if a field has a specific validate rule.
+func hasValidateRule(field model.Field, ruleName string) bool {
+	for _, rule := range parseValidateTag(field) {
+		if rule.Name == ruleName {
+			return true
+		}
+	}
+	return false
+}
+
+// getValidateValue gets the value for a validate rule.
+func getValidateValue(field model.Field, ruleName string) string {
+	for _, rule := range parseValidateTag(field) {
+		if rule.Name == ruleName {
+			return rule.Value
+		}
+	}
+	return ""
+}
+
+// valibotFormField generates a Valibot field expression for form validation.
+// It uses v.optional() with defaults and adds validators from validate tags.
+func valibotFormField(field model.Field) string {
+	typeKind := field.Type.Kind
+	typeName := field.Type.Name
+
+	// Determine base type and default value
+	var baseType, defaultVal string
+	isNumeric := false
+
+	switch typeKind {
+	case model.KindBasic:
+		switch {
+		case typeName == "string":
+			baseType = "v.string()"
+			defaultVal = "''"
+		case typeName == "bool":
+			baseType = "v.boolean()"
+			defaultVal = "false"
+		case strings.HasPrefix(typeName, "int") || strings.HasPrefix(typeName, "uint") ||
+			strings.HasPrefix(typeName, "float") || typeName == "byte" || typeName == "rune":
+			baseType = "v.number()"
+			defaultVal = "0"
+			isNumeric = true
+		default:
+			baseType = "v.unknown()"
+			defaultVal = "undefined"
+		}
+	case model.KindNamed:
+		// Handle special named types
+		if field.Type.Raw == "time.Time" {
+			baseType = "v.string()"
+			defaultVal = "''"
+		} else if field.Type.Raw == "uuid.UUID" {
+			baseType = "v.string()"
+			defaultVal = "''"
+		} else {
+			// Reference to another schema
+			return fmt.Sprintf("%sSchema", field.Type.Name)
+		}
+	case model.KindSlice, model.KindArray:
+		elemType := valibotElemType(field.Type.Elem)
+		return fmt.Sprintf("v.optional(v.array(%s), [])", elemType)
+	case model.KindMap:
+		keyType := valibotElemType(field.Type.Key)
+		valueType := valibotElemType(field.Type.Value)
+		return fmt.Sprintf("v.optional(v.record(%s, %s), {})", keyType, valueType)
+	case model.KindPointer:
+		// Pointers are nullable
+		elemType := valibotElemType(field.Type.Elem)
+		return fmt.Sprintf("v.nullable(%s)", elemType)
+	default:
+		baseType = "v.unknown()"
+		defaultVal = "undefined"
+	}
+
+	// Build validators from validate tag
+	var validators []string
+	rules := parseValidateTag(field)
+
+	for _, rule := range rules {
+		switch rule.Name {
+		case "min":
+			if isNumeric {
+				validators = append(validators, fmt.Sprintf("v.minValue(%s)", rule.Value))
+			} else {
+				validators = append(validators, fmt.Sprintf("v.minLength(%s)", rule.Value))
+			}
+		case "max":
+			if isNumeric {
+				validators = append(validators, fmt.Sprintf("v.maxValue(%s)", rule.Value))
+			} else {
+				validators = append(validators, fmt.Sprintf("v.maxLength(%s)", rule.Value))
+			}
+		case "email":
+			validators = append(validators, "v.email()")
+		case "url":
+			validators = append(validators, "v.url()")
+		case "uuid":
+			validators = append(validators, "v.uuid()")
+		}
+	}
+
+	// Build the final expression
+	optionalExpr := fmt.Sprintf("v.optional(%s, %s)", baseType, defaultVal)
+
+	if len(validators) == 0 {
+		return optionalExpr
+	}
+
+	// Use v.pipe() when we have validators
+	parts := append([]string{optionalExpr}, validators...)
+	return fmt.Sprintf("v.pipe(%s)", strings.Join(parts, ", "))
+}
+
+// valibotElemType returns the Valibot type for a TypeRef element.
+func valibotElemType(t *model.TypeRef) string {
+	if t == nil {
+		return "v.unknown()"
+	}
+
+	switch t.Kind {
+	case model.KindBasic:
+		switch t.Name {
+		case "string":
+			return "v.string()"
+		case "bool":
+			return "v.boolean()"
+		default:
+			if strings.HasPrefix(t.Name, "int") || strings.HasPrefix(t.Name, "uint") ||
+				strings.HasPrefix(t.Name, "float") || t.Name == "byte" || t.Name == "rune" {
+				return "v.number()"
+			}
+			return "v.unknown()"
+		}
+	case model.KindNamed:
+		if t.Raw == "time.Time" {
+			return "v.pipe(v.string(), v.isoDateTime())"
+		} else if t.Raw == "uuid.UUID" {
+			return "v.pipe(v.string(), v.uuid())"
+		}
+		return fmt.Sprintf("%sSchema", t.Name)
+	case model.KindSlice, model.KindArray:
+		return fmt.Sprintf("v.array(%s)", valibotElemType(t.Elem))
+	case model.KindMap:
+		return fmt.Sprintf("v.record(%s, %s)", valibotElemType(t.Key), valibotElemType(t.Value))
+	case model.KindPointer:
+		return fmt.Sprintf("v.nullable(%s)", valibotElemType(t.Elem))
+	case model.KindInterface:
+		return "v.unknown()"
+	default:
+		return "v.unknown()"
+	}
 }

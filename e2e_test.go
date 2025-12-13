@@ -308,6 +308,84 @@ export type {{ .Name }} = v.InferOutput<typeof {{ .Name }}Schema>;
 	}
 }
 
+// TestE2E_ValibotFormGeneration tests Valibot form schema generation with validate tags.
+func TestE2E_ValibotFormGeneration(t *testing.T) {
+	inputContent := `package models
+
+type UnitMessage struct {
+	Code        string  ` + "`json:\"code\" validate:\"required,min=1,max=45\"`" + `
+	Name        string  ` + "`json:\"name\" validate:\"required,min=2,max=45\"`" + `
+	Description string  ` + "`json:\"description\" validate:\"max=255\"`" + `
+	Email       string  ` + "`json:\"email\" validate:\"email\"`" + `
+	Website     string  ` + "`json:\"website\" validate:\"url\"`" + `
+	Count       int     ` + "`json:\"count\" validate:\"min=0,max=100\"`" + `
+	Price       float64 ` + "`json:\"price\"`" + `
+	Active      bool    ` + "`json:\"active\"`" + `
+	Tags        []string ` + "`json:\"tags\"`" + `
+	Meta        map[string]string ` + "`json:\"meta\"`" + `
+}
+`
+	tmpDir := t.TempDir()
+	inputPath := filepath.Join(tmpDir, "input.go")
+
+	if err := os.WriteFile(inputPath, []byte(inputContent), 0644); err != nil {
+		t.Fatalf("failed to write input file: %v", err)
+	}
+
+	// Use the actual valibot-form.tmpl template
+	templatePath := "templates/valibot-form.tmpl"
+	if _, err := os.Stat(templatePath); os.IsNotExist(err) {
+		t.Skip("valibot-form.tmpl not found")
+	}
+
+	cfg := config.New()
+	p := parser.New()
+
+	file, err := p.ParseFile(inputPath)
+	if err != nil {
+		t.Fatalf("failed to parse file: %v", err)
+	}
+
+	gen := generator.New(cfg)
+	if err := gen.LoadTemplate(templatePath); err != nil {
+		t.Fatalf("failed to load template: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := gen.Generate(file, &buf); err != nil {
+		t.Fatalf("failed to generate: %v", err)
+	}
+
+	output := buf.String()
+
+	tests := []struct {
+		name     string
+		contains string
+	}{
+		{"valibot import", "import * as v from 'valibot';"},
+		{"schema definition", "export const UnitMessageSchema = v.object({"},
+		{"code with minLength/maxLength", "v.pipe(v.optional(v.string(), ''), v.minLength(1), v.maxLength(45))"},
+		{"name with minLength/maxLength", "v.pipe(v.optional(v.string(), ''), v.minLength(2), v.maxLength(45))"},
+		{"description with maxLength only", "v.pipe(v.optional(v.string(), ''), v.maxLength(255))"},
+		{"email validation", "v.pipe(v.optional(v.string(), ''), v.email())"},
+		{"url validation", "v.pipe(v.optional(v.string(), ''), v.url())"},
+		{"count with minValue/maxValue", "v.pipe(v.optional(v.number(), 0), v.minValue(0), v.maxValue(100))"},
+		{"price number default", "v.optional(v.number(), 0)"},
+		{"active boolean default", "v.optional(v.boolean(), false)"},
+		{"tags array default", "v.optional(v.array(v.string()), [])"},
+		{"meta record default", "v.optional(v.record(v.string(), v.string()), {})"},
+		{"type inference", "export type UnitMessage = v.InferOutput<typeof UnitMessageSchema>;"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if !strings.Contains(output, tc.contains) {
+				t.Errorf("output does not contain %q\nGot:\n%s", tc.contains, output)
+			}
+		})
+	}
+}
+
 // TestE2E_EmbeddedFields tests that embedded fields are flattened.
 func TestE2E_EmbeddedFields(t *testing.T) {
 	inputContent := `package models
@@ -1183,6 +1261,39 @@ func TestE2E_IntegrationWithExamples(t *testing.T) {
 		}
 		if !strings.Contains(output, "v.InferOutput") {
 			t.Error("Valibot output should contain type inference")
+		}
+	})
+
+	t.Run("Valibot form generation", func(t *testing.T) {
+		valibotFormTemplatePath := "templates/valibot-form.tmpl"
+		if _, err := os.Stat(valibotFormTemplatePath); os.IsNotExist(err) {
+			t.Skip("valibot-form.tmpl not found")
+		}
+
+		gen := generator.New(cfg)
+		if err := gen.LoadTemplate(valibotFormTemplatePath); err != nil {
+			t.Fatalf("failed to load Valibot form template: %v", err)
+		}
+
+		var buf bytes.Buffer
+		if err := gen.Generate(file, &buf); err != nil {
+			t.Fatalf("failed to generate Valibot form: %v", err)
+		}
+
+		output := buf.String()
+		if len(output) == 0 {
+			t.Error("generated empty Valibot form output")
+		}
+
+		// Basic sanity checks
+		if !strings.Contains(output, "import * as v from 'valibot'") {
+			t.Error("Valibot form output should contain import")
+		}
+		if !strings.Contains(output, "UserSchema") {
+			t.Error("Valibot form output should contain UserSchema")
+		}
+		if !strings.Contains(output, "v.optional") {
+			t.Error("Valibot form output should use v.optional for form fields")
 		}
 	})
 }
